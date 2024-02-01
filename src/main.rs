@@ -21,6 +21,7 @@ use tokio::fs as tfs;
 use tokio::io::AsyncBufReadExt;
 use tokio_retry::RetryIf;
 use tokio_stream::wrappers::LinesStream;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -38,6 +39,7 @@ async fn main_result() -> Result<(), DlmError> {
     // CLI args
     let Arguments {
         input_file,
+        name_file,
         max_concurrent_downloads,
         output_dir,
         user_agent,
@@ -50,6 +52,14 @@ async fn main_result() -> Result<(), DlmError> {
     if nb_of_lines == 0 {
         return Err(EmptyInputFile);
     }
+
+    if let Some(nf) = name_file.clone() {
+        let name_lines_count = count_non_empty_lines(&nf).await?;
+        if name_lines_count != nb_of_lines {
+            return Err(DlmError::MismatchedLineCount);
+        }
+    }
+    let filenames = Arc::new(load_filenames(&name_file.unwrap()).await.unwrap()); // Assuming load_filenames returns Vec<String>
 
     // setup HTTP clients
     let client = make_client(&user_agent, &proxy, true, connection_timeout_secs)?;
@@ -74,57 +84,70 @@ async fn main_result() -> Result<(), DlmError> {
     // start streaming lines from file
     let file = tfs::File::open(input_file).await?;
     let file_reader = tokio::io::BufReader::new(file);
-    let line_stream = LinesStream::new(file_reader.lines());
+    let line_stream = LinesStream::new(file_reader.lines()).enumerate();
+    let filenames_clone = filenames.clone();
+    println!("{filenames_clone:?}");
     line_stream
-        .for_each_concurrent(max_concurrent_downloads, |link_res| async move {
-            let message = match link_res {
-                Err(e) => format!("Error with links iterator {}", e),
-                Ok(link) if link.trim().is_empty() => "Skipping empty line".to_string(),
-                Ok(link) => {
-                    // claim a progress bar for the upcoming download
-                    let dl_pb = pbm_ref
-                        .rx
-                        .recv()
-                        .await
-                        .expect("claiming progress bar should not fail");
+        .enumerate()
+        .for_each_concurrent(max_concurrent_downloads, |(index, link_res)| {
+            let filenames_clone = filenames.clone();
+            let pbm_ref_clone = pbm_ref.clone();
+            let c_ref_clone = c_ref.clone();
+            let c_no_redirect_ref_clone = c_no_redirect_ref.clone();
+            let od_ref_clone = od_ref.clone();
+            async move {
+                let message = match link_res {
+                    (_, Err(e)) => format!("Error with links iterator {}", e),
+                    (_, Ok(link)) if link.trim().is_empty() => "Skipping empty line".to_string(),
+                    (index, Ok(link)) => {
+                        let filename = filenames_clone.get(index).map(String::as_str);
 
-                    // exponential backoff retries for network errors
-                    let retry_strategy = retry_strategy(retry);
+                        // claim a progress bar for the upcoming download
+                        let dl_pb = pbm_ref_clone
+                            .rx
+                            .recv()
+                            .await
+                            .expect("claiming progress bar should not fail");
 
-                    let processed = RetryIf::spawn(
-                        retry_strategy,
-                        || {
-                            download_link(
-                                &link,
-                                c_ref,
-                                c_no_redirect_ref,
-                                connection_timeout_secs,
-                                od_ref,
-                                &dl_pb,
-                                pbm_ref,
-                            )
-                        },
-                        |e: &DlmError| retry_handler(e, pbm_ref, &link),
-                    )
-                    .await;
+                        // exponential backoff retries for network errors
+                        let retry_strategy = retry_strategy(retry);
 
-                    // reset & release progress bar
-                    ProgressBarManager::reset_progress_bar(&dl_pb);
-                    pbm_ref
-                        .tx
-                        .send(dl_pb)
-                        .await
-                        .expect("releasing progress bar should not fail");
+                        let processed = RetryIf::spawn(
+                            retry_strategy,
+                            || {
+                                download_link(
+                                    &link,
+                                    &c_ref_clone,
+                                    &c_no_redirect_ref_clone,
+                                    connection_timeout_secs,
+                                    &od_ref_clone,
+                                    &dl_pb,
+                                    &pbm_ref_clone,
+                                    filename,
+                                )
+                            },
+                            |e: &DlmError| retry_handler(e, &pbm_ref_clone, &link),
+                        )
+                        .await;
 
-                    // extract result
-                    match processed {
-                        Ok(info) => info,
-                        Err(e) => format!("Unrecoverable error while processing {}: {}", link, e),
+                        // reset & release progress bar
+                        ProgressBarManager::reset_progress_bar(&dl_pb);
+                        pbm_ref_clone
+                            .tx
+                            .send(dl_pb)
+                            .await
+                            .expect("releasing progress bar should not fail");
+
+                        // extract result
+                        match processed {
+                            Ok(info) => info,
+                            Err(e) => format!("Unrecoverable error while processing {}: {}", link, e),
+                        }
                     }
-                }
-            };
-            pbm_ref.log_above_progress_bars(message);
-            pbm_ref.increment_global_progress();
+                };
+                pbm_ref_clone.log_above_progress_bars(message);
+                pbm_ref_clone.increment_global_progress();
+            }
         })
         .await;
 
@@ -146,4 +169,15 @@ async fn count_non_empty_lines(input_file: &str) -> Result<i32, DlmError> {
         })
         .await;
     Ok(line_nb)
+}
+
+async fn load_filenames(name_file: &str) -> Result<Vec<String>, DlmError> {
+    let file = tfs::File::open(name_file).await?;
+    let file_reader = tokio::io::BufReader::new(file);
+    let lines = LinesStream::new(file_reader.lines())
+        .filter_map(|line| async move { line.ok().filter(|l| !l.trim().is_empty()) })
+        .collect::<Vec<String>>()
+        .await;
+
+    Ok(lines)
 }

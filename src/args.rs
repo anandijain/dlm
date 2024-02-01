@@ -77,10 +77,20 @@ fn command() -> Command {
                 .num_args(1)
                 .required(false),
         )
+        .arg(
+            Arg::new("name_file")
+                .help("Newline delimited text file specifying save locations corresponding to URLs")
+                .long("fileNames")
+                .short('f')
+                .num_args(1)
+                .required(false),
+        )
 }
 
 pub struct Arguments {
     pub input_file: String,
+    pub name_file: Option<String>,
+
     pub max_concurrent_downloads: usize,
     pub output_dir: String,
     pub user_agent: Option<UserAgent>,
@@ -108,6 +118,9 @@ pub fn get_args() -> Result<Arguments, DlmError> {
         .expect("impossible")
         .trim()
         .to_string();
+
+    let name_file: Option<String> = matches.get_one::<String>("name_file").cloned();
+
     if !Path::new(&input_file).is_file() {
         return Err(CliArgumentError {
             message: "'inputFile' does not exist".to_string(),
@@ -147,6 +160,7 @@ pub fn get_args() -> Result<Arguments, DlmError> {
 
     Ok(Arguments {
         input_file,
+        name_file,
         max_concurrent_downloads,
         output_dir,
         user_agent,

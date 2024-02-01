@@ -1,6 +1,7 @@
 use indicatif::ProgressBar;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
+use std::ffi::OsStr;
 use std::path::Path;
 use tokio::fs as tfs;
 use tokio::io::AsyncWriteExt;
@@ -21,32 +22,67 @@ pub async fn download_link(
     output_dir: &str,
     pb_dl: &ProgressBar,
     pb_manager: &ProgressBarManager,
+    filename: Option<&str>,
 ) -> Result<String, DlmError> {
     let file_link = FileLink::new(raw_link.to_string())?;
-    let (extension, filename_without_extension) = match file_link.extension {
-        Some(ext) => (ext, file_link.filename_without_extension),
-        None => {
-            fetch_filename_extension(
-                &file_link.url,
-                &file_link.filename_without_extension,
-                client,
-                client_no_redirect,
-                pb_manager,
-            )
-            .await?
+    println!("{filename:?}");
+    let (extension, filename_without_extension) = if let Some(custom_filename) = filename {
+        // Extract the extension and filename_without_extension from the provided filename
+        let custom_path = Path::new(custom_filename);
+        let extension = custom_path
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                panic!()
+                // DlmError::Other("No valid extension found in custom filename".to_string())
+            }).unwrap();
+        let filename_without_extension = custom_path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                panic!()
+                // DlmError::Custom("No valid filename found in custom filename".to_string())
+            }).unwrap();
+
+        (extension, filename_without_extension)
+    } else {
+        match file_link.extension {
+            Some(ext) => (ext, file_link.filename_without_extension),
+            None => {
+                fetch_filename_extension(
+                    &file_link.url,
+                    &file_link.filename_without_extension,
+                    client,
+                    client_no_redirect,
+                    pb_manager,
+                )
+                .await?
+            }
         }
     };
     let filename_with_extension = format!("{}.{}", filename_without_extension, extension);
     let final_file_path = &format!("{}/{}", output_dir, filename_with_extension);
-    if Path::new(final_file_path).exists() {
-        let final_file_size = tfs::File::open(final_file_path)
+
+    let final_filename = if let Some(custom_filename) = filename {
+        custom_filename.to_string()
+    } else {
+        format!("{}.{}", filename_without_extension, extension)
+    };
+
+    let final_file_path = Path::new(output_dir).join(&final_filename);
+    let tmp_name = final_file_path.with_extension("part");
+
+    if final_file_path.exists() {
+        let final_file_size = tfs::File::open(&final_file_path)
             .await?
             .metadata()
             .await?
             .len();
         let msg = format!(
             "Skipping {} because the file is already completed [{}]",
-            filename_with_extension,
+            final_filename,
             pretty_bytes_size(final_file_size)
         );
         Ok(msg)
